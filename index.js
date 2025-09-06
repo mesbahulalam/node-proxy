@@ -27,6 +27,8 @@ const { Duplex } = require('stream');
 const sqlite3 = require('sqlite3').verbose();
 const http = require('http');
 const querystring = require('querystring');
+const { URL } = require('url');
+
 
 // --- CONFIGURATION ---
 
@@ -43,13 +45,13 @@ const ADMIN_PASSWORD = 'changeme'; // IMPORTANT: Change this password!
 const initialUsers = {
     'demo': {
         password: 'password123',
-        throttle: 250 * 1024, // 250 KB/s
+        throttle: 250 * 1024, // 250 KB/s (~1.95 Mbps)
         bill_amount: 5,
         valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] // 30 days from now
     },
     'poweruser': {
         password: 'strongpassword',
-        throttle: 2 * 1024 * 1024, // 2 MB/s
+        throttle: 2 * 1024 * 1024, // 2 MB/s (16 Mbps)
         bill_amount: 20,
         valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
     },
@@ -400,10 +402,11 @@ function createRemoteConnection(clientSocket, user, host, port, successCallback,
         });
     });
 }
+
 function pipeData(clientSocket, remoteSocket, user, connectionType) {
     const userLabel = user ? user.username : 'unauthenticated';
     const throttleRate = user ? user.throttle : -1;
-    log(`Piping data for ${connectionType} connection. User: ${userLabel}. Throttle: ${throttleRate === -1 ? 'Unlimited' : `${throttleRate / 1024} KB/s`}`);
+    log(`Piping data for ${connectionType} connection. User: ${userLabel}. Throttle: ${throttleRate === -1 ? 'Unlimited' : `${((throttleRate * 8) / (1024 * 1024)).toFixed(2)} Mbps`}`);
     
     if (throttleRate > 0) {
         const clientToRemoteThrottler = new ThrottledStream(throttleRate);
@@ -429,8 +432,10 @@ const adminServer = http.createServer(async (req, res) => {
         const cookies = querystring.parse(req.headers.cookie, '; ');
         const sessionId = cookies.sessionId || '';
         const isAuthenticated = sessionStore[sessionId];
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const pathname = url.pathname;
 
-        if (req.url === '/login' && req.method === 'POST') {
+        if (pathname === '/login' && req.method === 'POST') {
             let body = '';
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', () => {
@@ -448,7 +453,7 @@ const adminServer = http.createServer(async (req, res) => {
             return;
         }
 
-        if (req.url === '/logout') {
+        if (pathname === '/logout') {
             delete sessionStore[sessionId];
             res.writeHead(302, { 'Set-Cookie': `sessionId=; HttpOnly; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`, 'Location': '/' });
             res.end();
@@ -457,29 +462,39 @@ const adminServer = http.createServer(async (req, res) => {
 
         if (!isAuthenticated) { 
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(getLoginPage(req.url.includes('error=1'))); 
+            res.end(getLoginPage(url.search.includes('error=1'))); 
             return; 
         }
 
         // --- Authenticated Routes ---
-        if (req.url === '/') {
+        if (pathname === '/') {
+            const filter = url.searchParams.get('filter') || 'all';
+
+            let whereClause = '';
+            if (filter === 'active') {
+                whereClause = `WHERE valid_until >= date('now')`;
+            } else if (filter === 'inactive') {
+                whereClause = `WHERE valid_until < date('now')`;
+            }
+            
+            const userList = await dbAll(`SELECT * FROM users ${whereClause}`, []);
             const today = new Date().toISOString().slice(0, 10);
             const month = new Date().toISOString().slice(0, 7);
 
             const earningsToday = await dbGet("SELECT SUM(bill_amount) as total FROM users WHERE date(created_at) = ?", [today]);
             const earningsMonth = await dbGet("SELECT SUM(bill_amount) as total FROM users WHERE strftime('%Y-%m', created_at) = ?", [month]);
             const earningsTotal = await dbGet("SELECT SUM(bill_amount) as total FROM users", []);
-            const userList = await dbAll('SELECT * FROM users ORDER BY username', []);
 
             const stats = {
                 today: earningsToday.total || 0,
                 month: earningsMonth.total || 0,
                 total: earningsTotal.total || 0,
             };
+            
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(getDashboardPage(userList, stats));
+            res.end(getDashboardPage(userList, stats, { filter }));
 
-        } else if (req.url === '/add-user' && req.method === 'POST') {
+        } else if (pathname === '/add-user' && req.method === 'POST') {
             let body = ''; 
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
@@ -492,7 +507,7 @@ const adminServer = http.createServer(async (req, res) => {
                     res.end();
                 });
             });
-        } else if (req.url === '/edit-user' && req.method === 'POST') {
+        } else if (pathname === '/edit-user' && req.method === 'POST') {
             let body = ''; 
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
@@ -505,7 +520,7 @@ const adminServer = http.createServer(async (req, res) => {
                     res.end();
                 });
             });
-        } else if (req.url === '/delete-user' && req.method === 'POST') {
+        } else if (pathname === '/delete-user' && req.method === 'POST') {
             let body = ''; 
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
@@ -514,6 +529,31 @@ const adminServer = http.createServer(async (req, res) => {
                     await loadUsersFromDb(); 
                     res.writeHead(302, { 'Location': '/' });
                     res.end();
+                });
+            });
+        } else if (pathname === '/delete-users' && req.method === 'POST') {
+             let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', async () => {
+                const { usernames } = querystring.parse(body);
+                if (!usernames || (Array.isArray(usernames) && usernames.length === 0)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ message: 'No users selected' }));
+                    return;
+                }
+                const usersToDelete = Array.isArray(usernames) ? usernames : [usernames];
+                const placeholders = usersToDelete.map(() => '?').join(',');
+                
+                db.run(`DELETE FROM users WHERE username IN (${placeholders})`, usersToDelete, async function(err) {
+                    if (err) {
+                        log(`Error deleting users: ${err.message}`);
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ message: 'Failed to delete users' }));
+                        return;
+                    }
+                    await loadUsersFromDb();
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ message: 'Users deleted successfully' }));
                 });
             });
         } else { 
@@ -563,19 +603,16 @@ function getLoginPage(error = false) { /* Unchanged from previous version */
     `;
 }
 
-function getDashboardPage(userList, stats) {
-    const userRows = userList.map(user => `
-        <tr class="border-b bg-gray-800 border-gray-700 hover:bg-gray-600">
-            <td class="px-6 py-4 font-mono">${user.username}</td>
-            <td class="px-6 py-4">${user.throttle === -1 ? 'Unlimited' : `${(user.throttle / 1024).toFixed(1)} KB/s`}</td>
-            <td class="px-6 py-4">$${(user.bill_amount || 0).toFixed(2)}</td>
-            <td class="px-6 py-4">${user.valid_until || 'N/A'}</td>
-            <td class="px-6 py-4 text-right">
-                <button onclick="openEditModal('${user.username}', ${user.throttle}, ${user.bill_amount || 0}, '${user.valid_until || ''}')" class="font-medium text-blue-500 hover:underline mr-4">Edit</button>
-                <button onclick="confirmDelete('${user.username}')" class="font-medium text-red-500 hover:underline">Delete</button>
-            </td>
-        </tr>
-    `).join('');
+function getDashboardPage(userList, stats, pageOptions) {
+    const { filter } = pageOptions;
+    
+    const filterButton = (name, value) => {
+        const isActive = filter === value;
+        const classes = isActive 
+            ? 'px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg' 
+            : 'px-4 py-2 text-sm font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600';
+        return `<a href="/?filter=${value}" class="${classes}">${name}</a>`;
+    };
 
     return `
     <!DOCTYPE html>
@@ -585,6 +622,12 @@ function getDashboardPage(userList, stats) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Admin Dashboard</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            .sortable:hover { cursor: pointer; background-color: #374151; }
+            .sort-icon { display: inline-block; width: 1em; height: 1em; margin-left: 0.5em; opacity: 0.5; }
+            .sort-asc .sort-icon { content: '▲'; opacity: 1; }
+            .sort-desc .sort-icon { content: '▼'; opacity: 1; }
+        </style>
     </head>
     <body class="p-4 sm:p-6 md:p-8">
         <div class="max-w-7xl mx-auto">
@@ -602,132 +645,261 @@ function getDashboardPage(userList, stats) {
                 <div class="p-6 bg-gray-800 rounded-lg"><p class="text-sm text-gray-400">Earnings This Month</p><p class="text-3xl font-bold">$${stats.month.toFixed(2)}</p></div>
                 <div class="p-6 bg-gray-800 rounded-lg"><p class="text-sm text-gray-400">Total Earnings</p><p class="text-3xl font-bold">$${stats.total.toFixed(2)}</p></div>
             </div>
+
+            <div class="flex flex-wrap items-center justify-between gap-4 mb-4">
+                <div class="flex items-center gap-2">
+                    ${filterButton('All Users', 'all')}
+                    ${filterButton('Active', 'active')}
+                    ${filterButton('Inactive', 'inactive')}
+                </div>
+                 <div class="flex items-center gap-4">
+                    <input type="text" id="searchInput" placeholder="Search users..." class="px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                    <button id="bulkDeleteBtn" class="px-5 py-2.5 text-base font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 focus:ring-4 focus:ring-red-800 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Delete Selected</button>
+                </div>
+            </div>
             
             <div class="relative overflow-x-auto shadow-md sm:rounded-lg">
                 <table class="w-full text-sm text-left text-gray-400">
                     <thead class="text-xs uppercase bg-gray-700 text-gray-400">
                         <tr>
-                            <th scope="col" class="px-6 py-3">Username</th>
-                            <th scope="col" class="px-6 py-3">Bandwidth Throttle</th>
-                            <th scope="col" class="px-6 py-3">Bill Amount</th>
-                            <th scope="col" class="px-6 py-3">Valid Until</th>
-                            <th scope="col" class="px-6 py-3"><span class="sr-only">Actions</span></th>
+                            <th scope="col" class="px-6 py-3"><input type="checkbox" id="selectAllCheckbox"></th>
+                            <th scope="col" class="px-6 py-3 sortable" data-sort="username">Username <span class="sort-icon"></span></th>
+                            <th scope="col" class="px-6 py-3 sortable" data-sort="status">Status <span class="sort-icon"></span></th>
+                            <th scope="col" class="px-6 py-3 sortable" data-sort="throttle">Bandwidth <span class="sort-icon"></span></th>
+                            <th scope="col" class="px-6 py-3 sortable" data-sort="bill_amount">Bill <span class="sort-icon"></span></th>
+                            <th scope="col" class="px-6 py-3 sortable" data-sort="valid_until">Valid Until <span class="sort-icon"></span></th>
+                            <th scope="col" class="px-6 py-3">Actions</th>
                         </tr>
                     </thead>
-                    <tbody> ${userRows} </tbody>
+                    <tbody id="userTableBody"></tbody>
                 </table>
             </div>
+            <div id="pagination-controls" class="flex flex-wrap items-center justify-between mt-6 gap-4"></div>
         </div>
 
-        <!-- Add/Edit Modal -->
-        <div id="userModal" class="fixed inset-0 z-50 items-center justify-center hidden bg-black bg-opacity-75" onclick="closeModal(event)">
-            <div class="w-full max-w-md p-8 space-y-6 bg-gray-800 rounded-lg shadow-lg" onclick="event.stopPropagation()">
-                <h3 id="modalTitle" class="text-2xl font-bold">Add New User</h3>
-                <form id="userForm" action="/add-user" method="POST" class="space-y-4">
-                    <input type="hidden" name="username" id="editUsername">
-                    <div>
-                        <label for="username" class="block mb-2 text-sm font-medium">Username</label>
-                        <input type="text" name="username" id="username" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" required>
-                    </div>
-                    <div>
-                        <label for="password" class="block mb-2 text-sm font-medium">Password <span id="passwordHint" class="text-xs text-gray-400"></span></label>
-                        <input type="password" name="password" id="password" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg">
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label for="throttle" class="block mb-2 text-sm font-medium">Throttle (KB/s, -1=inf)</label>
-                            <input type="number" name="throttle" id="throttle" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" value="-1" required>
-                        </div>
-                        <div>
-                            <label for="bill_amount" class="block mb-2 text-sm font-medium">Bill Amount ($)</label>
-                            <input type="number" step="0.01" name="bill_amount" id="bill_amount" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" value="0" required>
-                        </div>
-                    </div>
-                    <div>
-                        <label for="valid_until" class="block mb-2 text-sm font-medium">Valid Until</label>
-                        <input type="date" name="valid_until" id="valid_until" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" required>
-                        <div class="flex gap-2 mt-2">
-                            <button type="button" onclick="addDays(7)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">7 Days</button>
-                            <button type="button" onclick="addDays(15)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">15 Days</button>
-                            <button type="button" onclick="addDays(30)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">30 Days</button>
-                        </div>
-                    </div>
-                    <div class="flex justify-end gap-4 pt-4">
-                        <button type="button" onclick="closeModal()" class="px-5 py-2.5 text-base font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600">Cancel</button>
-                        <button type="submit" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Save User</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
+        <!-- Modals and Forms -->
+        <div id="userModal" class="fixed inset-0 z-50 items-center justify-center hidden bg-black bg-opacity-75" onclick="closeModal(event)"><div class="w-full max-w-md p-8 space-y-6 bg-gray-800 rounded-lg shadow-lg" onclick="event.stopPropagation()"><h3 id="modalTitle" class="text-2xl font-bold">Add New User</h3><form id="userForm" action="/add-user" method="POST" class="space-y-4"><input type="hidden" name="username" id="editUsername"><div><label for="username" class="block mb-2 text-sm font-medium">Username</label><input type="text" name="username" id="username" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" required></div><div><label for="password" class="block mb-2 text-sm font-medium">Password <span id="passwordHint" class="text-xs text-gray-400"></span></label><input type="password" name="password" id="password" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg"></div><div class="grid grid-cols-2 gap-4"><div><label for="throttle" class="block mb-2 text-sm font-medium">Throttle (Mbps, -1=inf)</label><input type="number" step="0.01" name="throttle" id="throttle" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" value="-1" required></div><div><label for="bill_amount" class="block mb-2 text-sm font-medium">Bill Amount ($)</label><input type="number" step="0.01" name="bill_amount" id="bill_amount" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" value="0" required></div></div><div><label for="valid_until" class="block mb-2 text-sm font-medium">Valid Until</label><input type="date" name="valid_until" id="valid_until" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" required><div class="flex gap-2 mt-2"><button type="button" onclick="addDays(7)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">7 Days</button><button type="button" onclick="addDays(15)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">15 Days</button><button type="button" onclick="addDays(30)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">30 Days</button></div></div><div class="flex justify-end gap-4 pt-4"><button type="button" onclick="closeModal()" class="px-5 py-2.5 text-base font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600">Cancel</button><button type="submit" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Save User</button></div></form></div></div>
+        <div id="confirmModal" class="fixed inset-0 z-50 items-center justify-center hidden bg-black bg-opacity-75"><div class="w-full max-w-md p-8 space-y-6 bg-gray-800 rounded-lg shadow-lg"><h3 id="confirmTitle" class="text-xl font-bold">Confirm Action</h3><p id="confirmMessage">Are you sure?</p><div class="flex justify-end gap-4 pt-4"><button id="confirmCancelBtn" class="px-5 py-2.5 text-base font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600">Cancel</button><button id="confirmOkBtn" class="px-5 py-2.5 text-base font-medium text-white bg-red-600 rounded-lg hover:bg-red-700">Confirm</button></div></div></div>
+        <div id="alertModal" class="fixed inset-0 z-50 items-center justify-center hidden bg-black bg-opacity-75"><div class="w-full max-w-md p-8 space-y-6 bg-gray-800 rounded-lg shadow-lg"><h3 id="alertTitle" class="text-xl font-bold text-yellow-400">Alert</h3><p id="alertMessage"></p><div class="flex justify-end gap-4 pt-4"><button id="alertOkBtn" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">OK</button></div></div></div>
         <form id="deleteForm" action="/delete-user" method="POST" class="hidden"><input type="hidden" name="username" id="deleteUsername"></form>
 
         <script>
-            const modal = document.getElementById('userModal');
-            const form = document.getElementById('userForm');
-            const title = document.getElementById('modalTitle');
-            const usernameInput = document.getElementById('username');
-            const passwordInput = document.getElementById('password');
-            const passwordHint = document.getElementById('passwordHint');
-            const editUsernameInput = document.getElementById('editUsername'); // The hidden username input
-            const throttleInput = document.getElementById('throttle');
-            const billAmountInput = document.getElementById('bill_amount');
-            const validUntilInput = document.getElementById('valid_until');
-            
-            function openAddModal() {
-                form.reset(); 
-                form.action = '/add-user'; 
-                title.textContent = 'Add New User';
+            // --- DATA and STATE ---
+            const allUsers = ${JSON.stringify(userList)};
+            let state = {
+                users: allUsers,
+                currentPage: 1,
+                itemsPerPage: 10,
+                sortColumn: 'username',
+                sortDirection: 'asc',
+                searchQuery: ''
+            };
+
+            document.addEventListener('DOMContentLoaded', () => {
+                renderTable();
+
+                document.getElementById('searchInput').addEventListener('input', (e) => {
+                    state.searchQuery = e.target.value.toLowerCase();
+                    state.currentPage = 1;
+                    renderTable();
+                });
+
+                document.querySelectorAll('.sortable').forEach(header => {
+                    header.addEventListener('click', () => {
+                        const column = header.dataset.sort;
+                        if (state.sortColumn === column) {
+                            state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+                        } else {
+                            state.sortColumn = column;
+                            state.sortDirection = 'asc';
+                        }
+                        renderTable();
+                    });
+                });
+            });
+
+            // --- RENDER FUNCTIONS ---
+            function renderTable() {
+                const tableBody = document.getElementById('userTableBody');
+                const paginationControls = document.getElementById('pagination-controls');
                 
-                // For 'Add', enable the visible input and disable the hidden one.
-                usernameInput.disabled = false;
-                editUsernameInput.disabled = true;
+                // 1. Filter
+                let filteredUsers = state.users.filter(user => 
+                    user.username.toLowerCase().includes(state.searchQuery)
+                );
 
-                passwordInput.required = true; 
-                passwordHint.textContent = '';
-                validUntilInput.value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-                modal.style.display = 'flex';
+                // 2. Sort
+                filteredUsers.sort((a, b) => {
+                    const valA = a[state.sortColumn];
+                    const valB = b[state.sortColumn];
+                    let comparison = 0;
+
+                    if (state.sortColumn === 'status') {
+                        const statusA = new Date(a.valid_until) >= new Date();
+                        const statusB = new Date(b.valid_until) >= new Date();
+                        comparison = statusA === statusB ? 0 : statusA ? -1 : 1;
+                    } else if (typeof valA === 'string') {
+                        comparison = valA.localeCompare(valB);
+                    } else {
+                        comparison = valA - valB;
+                    }
+                    return state.sortDirection === 'asc' ? comparison : -comparison;
+                });
+
+                // 3. Paginate
+                const totalPages = Math.ceil(filteredUsers.length / state.itemsPerPage);
+                if (state.currentPage > totalPages && totalPages > 0) { state.currentPage = totalPages; }
+                const startIndex = (state.currentPage - 1) * state.itemsPerPage;
+                const paginatedUsers = filteredUsers.slice(startIndex, startIndex + state.itemsPerPage);
+
+                // 4. Render Rows
+                tableBody.innerHTML = paginatedUsers.length > 0 ? paginatedUsers.map(userToRowHtml).join('') : \`<tr><td colspan="7" class="text-center py-8 text-gray-500">No users found.</td></tr>\`;
+                
+                // 5. Render Pagination
+                paginationControls.innerHTML = generatePaginationHtml(filteredUsers.length, totalPages);
+                
+                // 6. Update Sort Icons
+                updateSortIcons();
+
+                // 7. Add event listeners for new elements
+                addDynamicEventListeners();
             }
 
-            function openEditModal(username, throttle, billAmount, validUntil) {
-                form.reset(); 
-                form.action = '/edit-user'; 
-                title.textContent = 'Edit User: ' + username;
+            function userToRowHtml(user) {
+                const today = new Date().setHours(0, 0, 0, 0);
+                const expiryDate = new Date(user.valid_until).setHours(0, 0, 0, 0);
+                const isActive = expiryDate >= today;
+                const statusClass = isActive ? 'bg-green-500' : 'bg-red-500';
+                const statusText = isActive ? 'Active' : 'Expired';
+                const validUntilHtml = isActive ? user.valid_until : \`<span class="font-bold text-red-500">Expired</span>\`;
 
-                // For 'Edit', disable the visible input (it's just for display)
-                // and use the hidden input to submit the user's name.
-                usernameInput.value = username; 
-                usernameInput.disabled = true; 
-                editUsernameInput.value = username;
-                editUsernameInput.disabled = false;
-
-                passwordInput.placeholder = "Leave blank to keep unchanged"; 
-                passwordInput.required = false; 
-                passwordHint.textContent = '(Leave blank to keep unchanged)';
-                throttleInput.value = throttle === -1 ? -1 : (throttle / 1024);
-                billAmountInput.value = billAmount;
-                validUntilInput.value = validUntil;
-                modal.style.display = 'flex';
+                return \`
+                    <tr class="border-b bg-gray-800 border-gray-700 hover:bg-gray-600">
+                        <td class="px-6 py-4"><input type="checkbox" name="usernames" value="\${user.username}" class="user-checkbox"></td>
+                        <td class="px-6 py-4 font-mono">\${user.username}</td>
+                        <td class="px-6 py-4"><span class="flex items-center"><span class="inline-block w-3 h-3 \${statusClass} rounded-full mr-2"></span>\${statusText}</span></td>
+                        <td class="px-6 py-4">\${user.throttle === -1 ? 'Unlimited' : \`\${((user.throttle * 8) / (1024 * 1024)).toFixed(2)} Mbps\`}</td>
+                        <td class="px-6 py-4">$ \${(user.bill_amount || 0).toFixed(2)}</td>
+                        <td class="px-6 py-4">\${validUntilHtml}</td>
+                        <td class="px-6 py-4 text-right">
+                            <button onclick="openEditModal('\${user.username}', \${user.throttle}, \${user.bill_amount || 0}, '\${user.valid_until || ''}')" class="font-medium text-blue-500 hover:underline mr-4">Edit</button>
+                            <button onclick="confirmDelete('\${user.username}')" class="font-medium text-red-500 hover:underline">Delete</button>
+                        </td>
+                    </tr>\`;
             }
 
-            function closeModal(event) { if (!event || event.target === modal) { modal.style.display = 'none'; } }
-            function confirmDelete(username) { if (confirm('Delete user "' + username + '"?')) { document.getElementById('deleteUsername').value = username; document.getElementById('deleteForm').submit(); } }
-            function addDays(days) {
-                const date = validUntilInput.value ? new Date(validUntilInput.value) : new Date();
-                date.setDate(date.getDate() + days);
-                validUntilInput.value = date.toISOString().split('T')[0];
+            function generatePaginationHtml(totalItems, totalPages) {
+                if (totalItems === 0) return '';
+                const startItem = (state.currentPage - 1) * state.itemsPerPage + 1;
+                const endItem = Math.min(startItem + state.itemsPerPage - 1, totalItems);
+
+                const itemsPerPageOptions = [10, 25, 50, 100].map(val => 
+                    \`<option value="\${val}" \${state.itemsPerPage === val ? 'selected' : ''}>\${val}</option>\`
+                ).join('');
+
+                const pageButtons = totalPages > 1 ? \`
+                    <div class="flex items-center gap-2">
+                        <button onclick="changePage('prev')" \${state.currentPage === 1 ? 'disabled' : ''} class="px-3 py-1 bg-gray-600 rounded disabled:opacity-50">Prev</button>
+                        <span>Page \${state.currentPage} of \${totalPages}</span>
+                        <button onclick="changePage('next', \${totalPages})" \${state.currentPage === totalPages ? 'disabled' : ''} class="px-3 py-1 bg-gray-600 rounded disabled:opacity-50">Next</button>
+                    </div>
+                \` : '';
+
+                return \`
+                    <div class="text-sm text-gray-400">
+                        Showing <span class="font-medium">\${startItem}</span> to <span class="font-medium">\${endItem}</span> of <span class="font-medium">\${totalItems}</span> results
+                    </div>
+                    <div class="flex items-center gap-4">
+                        <select id="itemsPerPage" class="px-2 py-1 bg-gray-700 border border-gray-600 rounded">\${itemsPerPageOptions}<option value="\${totalItems}" \${state.itemsPerPage === totalItems ? 'selected' : ''}>All</option></select>
+                        \${pageButtons}
+                    </div>
+                \`;
             }
             
+            function updateSortIcons() {
+                document.querySelectorAll('.sortable').forEach(header => {
+                    header.classList.remove('sort-asc', 'sort-desc');
+                    const icon = header.querySelector('.sort-icon');
+                    if (header.dataset.sort === state.sortColumn) {
+                        header.classList.add(state.sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
+                        icon.textContent = state.sortDirection === 'asc' ? '▲' : '▼';
+                    } else {
+                        icon.textContent = '';
+                    }
+                });
+            }
+
+            // --- DYNAMIC EVENT LISTENERS ---
+            function addDynamicEventListeners() {
+                // Bulk delete
+                const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+                const userCheckboxes = document.querySelectorAll('.user-checkbox');
+                const bulkDeleteBtn = document.getElementById('bulkDeleteBtn');
+
+                function updateDeleteButtonState() {
+                    const anyChecked = [...userCheckboxes].some(cb => cb.checked);
+                    bulkDeleteBtn.disabled = !anyChecked;
+                }
+                
+                selectAllCheckbox.addEventListener('change', e => {
+                    userCheckboxes.forEach(checkbox => { checkbox.checked = e.target.checked; });
+                    updateDeleteButtonState();
+                });
+                userCheckboxes.forEach(checkbox => {
+                    checkbox.addEventListener('change', () => {
+                        selectAllCheckbox.checked = userCheckboxes.length > 0 && [...userCheckboxes].every(cb => cb.checked);
+                        updateDeleteButtonState();
+                    });
+                });
+                updateDeleteButtonState();
+
+                // Items per page
+                const ippSelect = document.getElementById('itemsPerPage');
+                if (ippSelect) {
+                    ippSelect.addEventListener('change', (e) => {
+                        state.itemsPerPage = parseInt(e.target.value, 10);
+                        state.currentPage = 1;
+                        renderTable();
+                    });
+                }
+            }
+            
+            function changePage(direction, totalPages) {
+                if (direction === 'prev' && state.currentPage > 1) state.currentPage--;
+                if (direction === 'next' && state.currentPage < totalPages) state.currentPage++;
+                renderTable();
+            }
+
+            // --- MODALS and FORMS (mostly unchanged) ---
+            const userModal = document.getElementById('userModal'); const form = document.getElementById('userForm'); const title = document.getElementById('modalTitle'); const usernameInput = document.getElementById('username'); const passwordInput = document.getElementById('password'); const passwordHint = document.getElementById('passwordHint'); const editUsernameInput = document.getElementById('editUsername'); const throttleInput = document.getElementById('throttle'); const validUntilInput = document.getElementById('valid_until'); const confirmModal = document.getElementById('confirmModal'); const confirmTitle = document.getElementById('confirmTitle'); const confirmMessage = document.getElementById('confirmMessage'); const confirmOkBtn = document.getElementById('confirmOkBtn'); const confirmCancelBtn = document.getElementById('confirmCancelBtn'); const alertModal = document.getElementById('alertModal'); const alertTitle = document.getElementById('alertTitle'); const alertMessage = document.getElementById('alertMessage'); const alertOkBtn = document.getElementById('alertOkBtn'); let confirmCallback = null;
+            function openAddModal() { form.reset(); form.action = '/add-user'; title.textContent = 'Add New User'; usernameInput.disabled = false; editUsernameInput.disabled = true; passwordInput.required = true; passwordHint.textContent = ''; validUntilInput.value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]; userModal.style.display = 'flex'; }
+            function openEditModal(username, throttle, billAmount, validUntil) { form.reset(); form.action = '/edit-user'; title.textContent = 'Edit User: ' + username; usernameInput.value = username; usernameInput.disabled = true; editUsernameInput.value = username; editUsernameInput.disabled = false; passwordInput.placeholder = "Leave blank"; passwordInput.required = false; passwordHint.textContent = '(Leave blank to keep)'; throttleInput.value = throttle === -1 ? -1 : ((throttle * 8) / (1024 * 1024)).toFixed(2); document.getElementById('bill_amount').value = billAmount; validUntilInput.value = validUntil; userModal.style.display = 'flex'; }
+            function closeModal(event) { if (!event || event.target === userModal) { userModal.style.display = 'none'; } }
+            function addDays(days) { const date = validUntilInput.value ? new Date(validUntilInput.value) : new Date(); date.setDate(date.getDate() + days); validUntilInput.value = date.toISOString().split('T')[0]; }
             form.addEventListener('submit', function(e) {
-                const throttleKb = parseInt(throttleInput.value, 10);
-                const throttleBytes = throttleKb === -1 ? -1 : throttleKb * 1024;
+                // The original input has name="throttle" and a value in Mbps.
+                // We must convert this to bytes/sec for the backend.
+                // To avoid sending two 'throttle' values (the visible Mbps one and a hidden bytes one),
+                // we first create the hidden input with the correct byte value.
+                const throttleMbps = parseFloat(throttleInput.value);
+                const throttleBytes = throttleMbps === -1 ? -1 : Math.round((throttleMbps * 1024 * 1024) / 8);
                 const hiddenInput = document.createElement('input');
                 hiddenInput.type = 'hidden';
                 hiddenInput.name = 'throttle';
                 hiddenInput.value = throttleBytes;
                 form.appendChild(hiddenInput);
-                // NOTE: The logic that re-enabled the username field has been removed, fixing the bug.
+                
+                // Then, we remove the name from the original, visible input so it is not included in the form submission.
+                throttleInput.removeAttribute('name');
             });
+            function showAlert(message, title = 'Alert') { alertTitle.textContent = title; alertMessage.textContent = message; alertModal.style.display = 'flex'; }
+            alertOkBtn.addEventListener('click', () => { alertModal.style.display = 'none'; });
+            function showConfirm(title, message, callback) { confirmTitle.textContent = title; confirmMessage.textContent = message; confirmCallback = callback; confirmModal.style.display = 'flex'; }
+            function hideConfirm() { confirmModal.style.display = 'none'; confirmCallback = null; }
+            confirmOkBtn.addEventListener('click', () => { if (confirmCallback) { confirmCallback(); } hideConfirm(); });
+            confirmCancelBtn.addEventListener('click', hideConfirm);
+            function confirmDelete(username) { showConfirm('Delete User', \`Delete user "\${username}"?\`, () => { document.getElementById('deleteUsername').value = username; document.getElementById('deleteForm').submit(); }); }
+            document.getElementById('bulkDeleteBtn').addEventListener('click', async () => { const selectedUsers = [...document.querySelectorAll('.user-checkbox:checked')].map(cb => cb.value); if (selectedUsers.length === 0) return; showConfirm('Delete Users', \`Delete \${selectedUsers.length} selected user(s)?\`, async () => { try { const res = await fetch('/delete-users', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ 'usernames': selectedUsers }) }); if (res.ok) { window.location.reload(); } else { const err = await res.json(); showAlert('Error: ' + (err.message || 'Unknown error')); } } catch (error) { showAlert('Network error.'); } }); });
         </script>
     </body>
     </html>
