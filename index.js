@@ -661,7 +661,7 @@ function getDashboardPage(userList, stats, pagination) {
         return `/?${query.toString()}`;
     };
 
-    let paginationHtml = '';
+    let paginationNav = '';
     if (totalPages > 1) {
         const pages = [];
         const maxPagesToShow = 5;
@@ -699,22 +699,11 @@ function getDashboardPage(userList, stats, pagination) {
         
         const pageLinks = pages.join('');
 
-        paginationHtml = `<div class="flex flex-col items-center mt-6 sm:flex-row sm:justify-between">
-            <span class="text-sm text-gray-400 mb-4 sm:mb-0">
-                Showing <span class="font-semibold text-white">${totalUsers > 0 ? Math.min((page - 1) * limit + 1, totalUsers) : 0}</span> to <span class="font-semibold text-white">${Math.min(page * limit, totalUsers)}</span> of <span class="font-semibold text-white">${totalUsers}</span> Results
-            </span>
-            <nav class="inline-flex -space-x-px text-sm h-10">
-                ${prevButton}
-                ${pageLinks}
-                ${nextButton}
-            </nav>
-        </div>`;
-    } else if (totalUsers > 0) {
-        paginationHtml = `<div class="flex items-center justify-start mt-6">
-           <span class="text-sm text-gray-400">
-                Showing <span class="font-semibold text-white">1</span> to <span class="font-semibold text-white">${totalUsers}</span> of <span class="font-semibold text-white">${totalUsers}</span> Results
-            </span>
-        </div>`;
+        paginationNav = `<nav class="inline-flex -space-x-px text-sm h-10">
+            ${prevButton}
+            ${pageLinks}
+            ${nextButton}
+        </nav>`;
     }
 
     return `
@@ -744,40 +733,31 @@ function getDashboardPage(userList, stats, pagination) {
             </div>
 
             <div class="bg-gray-800 p-4 rounded-lg mb-4">
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div class="md:col-span-2">
-                        <form action="/" method="GET" class="flex items-center gap-2">
-                             <input type="hidden" name="limit" value="${limit}">
-                             <input type="hidden" name="filter" value="${filter}">
-                             <div class="relative w-full">
-                                <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                                    <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
-                                </div>
-                                <input type="search" name="search" value="${search}" placeholder="Search by username..." class="block w-full p-2.5 pl-10 text-sm rounded-lg bg-gray-700 border-gray-600 placeholder-gray-400 text-white focus:ring-blue-500 focus:border-blue-500">
-                             </div>
-                            <button type="submit" class="px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Search</button>
-                        </form>
+                 <!-- Row 1: Search -->
+                <div class="mb-4">
+                    <form action="/" method="GET" class="flex items-center gap-2">
+                        <input type="hidden" name="limit" value="${limit}">
+                        <input type="hidden" name="filter" value="${filter}">
+                        <div class="relative w-full">
+                            <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                                <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
+                            </div>
+                            <input type="search" name="search" value="${search}" placeholder="Search by username..." class="block w-full p-2.5 pl-10 text-sm rounded-lg bg-gray-700 border-gray-600 placeholder-gray-400 text-white focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <button type="submit" class="px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Search</button>
+                    </form>
+                </div>
+                <!-- Row 2: Filters and Bulk Delete -->
+                <div class="flex justify-between items-center">
+                    <div class="flex items-center gap-2">
+                        <a href="${buildUrl({ page: 1, filter: 'all' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'all' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">All</a>
+                        <a href="${buildUrl({ page: 1, filter: 'active' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'active' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Active</a>
+                        <a href="${buildUrl({ page: 1, filter: 'inactive' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'inactive' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Inactive</a>
                     </div>
-                    <div class="flex items-center justify-start md:justify-end gap-2">
-                         <a href="${buildUrl({ page: 1, filter: 'all' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'all' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">All</a>
-                         <a href="${buildUrl({ page: 1, filter: 'active' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'active' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Active</a>
-                         <a href="${buildUrl({ page: 1, filter: 'inactive' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'inactive' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Inactive</a>
+                    <div>
+                        <button id="bulkDeleteBtn" class="px-5 py-2.5 text-base font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 focus:ring-4 focus:ring-red-800 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Delete Selected</button>
                     </div>
                 </div>
-                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4 mt-4">
-                     <form id="limitForm" action="/" method="GET" class="flex items-center">
-                         <input type="hidden" name="filter" value="${filter}">
-                         <input type="hidden" name="search" value="${search}">
-                         <label for="limit" class="text-sm text-gray-400 mr-2">Show:</label>
-                         <select name="limit" id="limit" onchange="document.getElementById('limitForm').submit()" class="px-3 py-2 text-sm rounded-lg bg-gray-700 border-gray-600 text-white focus:ring-blue-500 focus:border-blue-500">
-                             <option value="10" ${limit === 10 ? 'selected' : ''}>10</option>
-                             <option value="25" ${limit === 25 ? 'selected' : ''}>25</option>
-                             <option value="50" ${limit === 50 ? 'selected' : ''}>50</option>
-                             <option value="100" ${limit === 100 ? 'selected' : ''}>100</option>
-                         </select>
-                     </form>
-                    <button id="bulkDeleteBtn" class="px-5 py-2.5 text-base font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 focus:ring-4 focus:ring-red-800 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Delete Selected</button>
-                 </div>
             </div>
             
             <div class="relative overflow-x-auto shadow-md sm:rounded-lg">
@@ -798,7 +778,26 @@ function getDashboardPage(userList, stats, pagination) {
                     <tbody> ${userRows.length > 0 ? userRows : `<tr><td colspan="7" class="text-center py-8 text-gray-500">No users found.</td></tr>`} </tbody>
                 </table>
             </div>
-            ${paginationHtml}
+            
+            <div class="flex flex-col justify-center items-center lg:flex-row lg:justify-between gap-4 mt-4">
+                <div class="flex items-center justify-center lg:justify-start lg:items-center text-sm text-gray-400">
+                    <form id="limitForm" action="/" method="GET" class="flex items-center mr-2">
+                        <input type="hidden" name="filter" value="${filter}">
+                        <input type="hidden" name="search" value="${search}">
+                        <label for="limit" class="mr-2">Show:</label>
+                        <select name="limit" id="limit" onchange="document.getElementById('limitForm').submit()" class="px-3 py-1.5 text-sm rounded-lg bg-gray-700 border-gray-600 text-white focus:ring-blue-500 focus:border-blue-500">
+                            <option value="10" ${limit === 10 ? 'selected' : ''}>10</option>
+                            <option value="25" ${limit === 25 ? 'selected' : ''}>25</option>
+                            <option value="50" ${limit === 50 ? 'selected' : ''}>50</option>
+                            <option value="100" ${limit === 100 ? 'selected' : ''}>100</option>
+                        </select>
+                    </form>
+                    <span>Showing <span class="font-semibold text-white">${totalUsers > 0 ? Math.min((page - 1) * limit + 1, totalUsers) : 0}</span>-<span class="font-semibold text-white">${Math.min(page * limit, totalUsers)}</span> of <span class="font-semibold text-white">${totalUsers}</span></span>
+                </div>
+                <div class="flex justify-center lg:justify-end">
+                    ${paginationNav}
+                </div>
+            </div>
         </div>
 
         <!-- Modals: Add/Edit, Confirm, Alert -->
@@ -976,3 +975,6 @@ server.on('error', (err) => {
     console.error(`Server error: ${err.message}`);
     if (err.code === 'EADDRINUSE') { console.error(`Port ${PROXY_PORT} is already in use.`); }
 });
+
+
+
