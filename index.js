@@ -469,22 +469,32 @@ const adminServer = http.createServer(async (req, res) => {
         // --- Authenticated Routes ---
         if (pathname === '/') {
             const page = parseInt(url.searchParams.get('page') || '1', 10);
-            const limit = 10; // Items per page
+            const limit = parseInt(url.searchParams.get('limit') || '10', 10);
             const filter = url.searchParams.get('filter') || 'all';
+            const search = url.searchParams.get('search') || '';
             const offset = (page - 1) * limit;
 
-            let whereClause = '';
+            let whereClauses = [];
+            let params = [];
+
             if (filter === 'active') {
-                whereClause = `WHERE valid_until >= date('now')`;
+                whereClauses.push(`valid_until >= date('now')`);
             } else if (filter === 'inactive') {
-                whereClause = `WHERE valid_until < date('now')`;
+                whereClauses.push(`valid_until < date('now')`);
             }
 
-            const countResult = await dbGet(`SELECT COUNT(*) as count FROM users ${whereClause}`, []);
+            if (search) {
+                whereClauses.push(`username LIKE ?`);
+                params.push(`%${search}%`);
+            }
+
+            const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+            
+            const countResult = await dbGet(`SELECT COUNT(*) as count FROM users ${whereClause}`, params);
             const totalUsers = countResult.count;
             const totalPages = Math.ceil(totalUsers / limit);
 
-            const userList = await dbAll(`SELECT * FROM users ${whereClause} ORDER BY username LIMIT ? OFFSET ?`, [limit, offset]);
+            const userList = await dbAll(`SELECT * FROM users ${whereClause} ORDER BY username LIMIT ? OFFSET ?`, [...params, limit, offset]);
             const today = new Date().toISOString().slice(0, 10);
             const month = new Date().toISOString().slice(0, 7);
 
@@ -497,7 +507,7 @@ const adminServer = http.createServer(async (req, res) => {
                 month: earningsMonth.total || 0,
                 total: earningsTotal.total || 0,
             };
-            const pagination = { page, totalPages, limit, filter, totalUsers };
+            const pagination = { page, totalPages, limit, filter, totalUsers, search };
             res.writeHead(200, { 'Content-Type': 'text/html' });
             res.end(getDashboardPage(userList, stats, pagination));
 
@@ -579,7 +589,7 @@ const sessionStore = {}; // Simple in-memory session store
 const dbGet = (sql, params) => new Promise((resolve, reject) => { db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)); });
 const dbAll = (sql, params) => new Promise((resolve, reject) => { db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows)); });
 
-function getLoginPage(error = false) { /* Unchanged from previous version */ 
+function getLoginPage(error = false) { 
     return `
     <!DOCTYPE html>
     <html lang="en" class="bg-gray-900 text-white">
@@ -611,7 +621,7 @@ function getLoginPage(error = false) { /* Unchanged from previous version */
 }
 
 function getDashboardPage(userList, stats, pagination) {
-    const { page, totalPages, filter } = pagination;
+    const { page, totalPages, filter, limit, search, totalUsers } = pagination;
     const userRows = userList.map(user => {
         const today = new Date().setHours(0,0,0,0);
         const expiryDate = new Date(user.valid_until).setHours(0,0,0,0);
@@ -641,20 +651,69 @@ function getDashboardPage(userList, stats, pagination) {
         </tr>
     `}).join('');
     
-    const filterButton = (name, value) => {
-        const isActive = filter === value;
-        const classes = isActive 
-            ? 'px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg' 
-            : 'px-4 py-2 text-sm font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600';
-        return `<a href="/?filter=${value}" class="${classes}">${name}</a>`;
+    const buildUrl = (params) => {
+        const currentParams = { filter, limit, search };
+        const newParams = { ...currentParams, ...params };
+        if (!newParams.search) {
+            delete newParams.search;
+        }
+        const query = new URLSearchParams(newParams);
+        return `/?${query.toString()}`;
     };
 
     let paginationHtml = '';
     if (totalPages > 1) {
-        paginationHtml = `<div class="flex items-center justify-between mt-6">
-            <a href="/?filter=${filter}&page=${page - 1}" class="${page <= 1 ? 'pointer-events-none opacity-50' : ''} px-4 py-2 text-sm font-medium text-white bg-gray-600 rounded-lg hover:bg-gray-700">Previous</a>
-            <span class="text-sm text-gray-400">Page ${page} of ${totalPages}</span>
-            <a href="/?filter=${filter}&page=${page + 1}" class="${page >= totalPages ? 'pointer-events-none opacity-50' : ''} px-4 py-2 text-sm font-medium text-white bg-gray-600 rounded-lg hover:bg-gray-700">Next</a>
+        const pages = [];
+        const maxPagesToShow = 5;
+        let startPage = Math.max(1, page - Math.floor(maxPagesToShow / 2));
+        let endPage = Math.min(totalPages, startPage + maxPagesToShow - 1);
+        
+        if (endPage - startPage + 1 < maxPagesToShow) {
+            startPage = Math.max(1, endPage - maxPagesToShow + 1);
+        }
+
+        const prevButton = `<a href="${buildUrl({ page: page - 1 })}" class="${page <= 1 ? 'pointer-events-none opacity-50' : ''} inline-flex items-center px-3 py-2 text-sm font-medium border rounded-l-lg bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white">« Prev</a>`;
+        const nextButton = `<a href="${buildUrl({ page: page + 1 })}" class="${page >= totalPages ? 'pointer-events-none opacity-50' : ''} inline-flex items-center px-3 py-2 text-sm font-medium border rounded-r-lg bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white">Next »</a>`;
+
+        if (startPage > 1) {
+            pages.push(`<a href="${buildUrl({ page: 1 })}" class="inline-flex items-center px-3 py-2 text-sm font-medium border-y border-l bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white">1</a>`);
+            if (startPage > 2) {
+                pages.push(`<span class="inline-flex items-center px-3 py-2 text-sm font-medium border-y border-l bg-gray-800 border-gray-700 text-gray-400">...</span>`);
+            }
+        }
+
+        for (let i = startPage; i <= endPage; i++) {
+            const isActive = i === page;
+            const classes = isActive
+                ? 'inline-flex items-center px-3 py-2 text-sm font-medium border z-10 bg-blue-600 border-blue-500 text-white'
+                : 'inline-flex items-center px-3 py-2 text-sm font-medium border bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white';
+            pages.push(`<a href="${buildUrl({ page: i })}" class="${classes}">${i}</a>`);
+        }
+
+        if (endPage < totalPages) {
+            if (endPage < totalPages - 1) {
+                pages.push(`<span class="inline-flex items-center px-3 py-2 text-sm font-medium border-y border-r bg-gray-800 border-gray-700 text-gray-400">...</span>`);
+            }
+            pages.push(`<a href="${buildUrl({ page: totalPages })}" class="inline-flex items-center px-3 py-2 text-sm font-medium border-y border-r bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white">${totalPages}</a>`);
+        }
+        
+        const pageLinks = pages.join('');
+
+        paginationHtml = `<div class="flex flex-col items-center mt-6 sm:flex-row sm:justify-between">
+            <span class="text-sm text-gray-400 mb-4 sm:mb-0">
+                Showing <span class="font-semibold text-white">${totalUsers > 0 ? Math.min((page - 1) * limit + 1, totalUsers) : 0}</span> to <span class="font-semibold text-white">${Math.min(page * limit, totalUsers)}</span> of <span class="font-semibold text-white">${totalUsers}</span> Results
+            </span>
+            <nav class="inline-flex -space-x-px text-sm h-10">
+                ${prevButton}
+                ${pageLinks}
+                ${nextButton}
+            </nav>
+        </div>`;
+    } else if (totalUsers > 0) {
+        paginationHtml = `<div class="flex items-center justify-start mt-6">
+           <span class="text-sm text-gray-400">
+                Showing <span class="font-semibold text-white">1</span> to <span class="font-semibold text-white">${totalUsers}</span> of <span class="font-semibold text-white">${totalUsers}</span> Results
+            </span>
         </div>`;
     }
 
@@ -684,15 +743,41 @@ function getDashboardPage(userList, stats, pagination) {
                 <div class="p-6 bg-gray-800 rounded-lg"><p class="text-sm text-gray-400">Total Earnings</p><p class="text-3xl font-bold">$${stats.total.toFixed(2)}</p></div>
             </div>
 
-            <div class="flex flex-wrap items-center justify-between gap-4 mb-4">
-                <div class="flex items-center gap-2">
-                    ${filterButton('All Users', 'all')}
-                    ${filterButton('Active', 'active')}
-                    ${filterButton('Inactive', 'inactive')}
+            <div class="bg-gray-800 p-4 rounded-lg mb-4">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="md:col-span-2">
+                        <form action="/" method="GET" class="flex items-center gap-2">
+                             <input type="hidden" name="limit" value="${limit}">
+                             <input type="hidden" name="filter" value="${filter}">
+                             <div class="relative w-full">
+                                <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                                    <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
+                                </div>
+                                <input type="search" name="search" value="${search}" placeholder="Search by username..." class="block w-full p-2.5 pl-10 text-sm rounded-lg bg-gray-700 border-gray-600 placeholder-gray-400 text-white focus:ring-blue-500 focus:border-blue-500">
+                             </div>
+                            <button type="submit" class="px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Search</button>
+                        </form>
+                    </div>
+                    <div class="flex items-center justify-start md:justify-end gap-2">
+                         <a href="${buildUrl({ page: 1, filter: 'all' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'all' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">All</a>
+                         <a href="${buildUrl({ page: 1, filter: 'active' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'active' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Active</a>
+                         <a href="${buildUrl({ page: 1, filter: 'inactive' })}" class="whitespace-nowrap px-4 py-2 text-sm font-medium rounded-lg ${filter === 'inactive' ? 'text-white bg-blue-600' : 'text-gray-300 bg-gray-700 hover:bg-gray-600'}">Inactive</a>
+                    </div>
                 </div>
-                <div>
+                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4 mt-4">
+                     <form id="limitForm" action="/" method="GET" class="flex items-center">
+                         <input type="hidden" name="filter" value="${filter}">
+                         <input type="hidden" name="search" value="${search}">
+                         <label for="limit" class="text-sm text-gray-400 mr-2">Show:</label>
+                         <select name="limit" id="limit" onchange="document.getElementById('limitForm').submit()" class="px-3 py-2 text-sm rounded-lg bg-gray-700 border-gray-600 text-white focus:ring-blue-500 focus:border-blue-500">
+                             <option value="10" ${limit === 10 ? 'selected' : ''}>10</option>
+                             <option value="25" ${limit === 25 ? 'selected' : ''}>25</option>
+                             <option value="50" ${limit === 50 ? 'selected' : ''}>50</option>
+                             <option value="100" ${limit === 100 ? 'selected' : ''}>100</option>
+                         </select>
+                     </form>
                     <button id="bulkDeleteBtn" class="px-5 py-2.5 text-base font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 focus:ring-4 focus:ring-red-800 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Delete Selected</button>
-                </div>
+                 </div>
             </div>
             
             <div class="relative overflow-x-auto shadow-md sm:rounded-lg">
@@ -710,7 +795,7 @@ function getDashboardPage(userList, stats, pagination) {
                             <th scope="col" class="px-6 py-3"><span class="sr-only">Actions</span></th>
                         </tr>
                     </thead>
-                    <tbody> ${userRows.length > 0 ? userRows : `<tr><td colspan="7" class="text-center py-8 text-gray-500">No users found for this filter.</td></tr>`} </tbody>
+                    <tbody> ${userRows.length > 0 ? userRows : `<tr><td colspan="7" class="text-center py-8 text-gray-500">No users found.</td></tr>`} </tbody>
                 </table>
             </div>
             ${paginationHtml}
@@ -840,7 +925,16 @@ function getDashboardPage(userList, stats, pagination) {
 
             userCheckboxes.forEach(checkbox => {
                 checkbox.addEventListener('change', () => {
-                    selectAllCheckbox.checked = [...userCheckboxes].every(cb => cb.checked);
+                    if ([...userCheckboxes].every(cb => cb.checked)) {
+                         selectAllCheckbox.checked = true;
+                         selectAllCheckbox.indeterminate = false;
+                    } else if ([...userCheckboxes].some(cb => cb.checked)) {
+                         selectAllCheckbox.checked = false;
+                         selectAllCheckbox.indeterminate = true;
+                    } else {
+                         selectAllCheckbox.checked = false;
+                         selectAllCheckbox.indeterminate = false;
+                    }
                     updateDeleteButtonState();
                 });
             });
@@ -882,4 +976,3 @@ server.on('error', (err) => {
     console.error(`Server error: ${err.message}`);
     if (err.code === 'EADDRINUSE') { console.error(`Port ${PROXY_PORT} is already in use.`); }
 });
-
