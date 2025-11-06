@@ -1,17 +1,22 @@
 /*
- * Multi-Protocol Proxy Server (SOCKS4, SOCKS5, HTTP) with User Management and Bandwidth Throttling
+ * Multi-Protocol Proxy Server (SOCKS4, SOCKS5, HTTP) with User Management,
+ * Bandwidth Throttling, Restricted Server Access, and Financial Reporting.
  *
  * Description:
- * This Node.js script creates a proxy server that handles SOCKS4, SOCKS5, and HTTP requests.
+ * This Node.js script creates a proxy server with a full admin panel.
  * It features a persistent user management system using SQLite, per-user bandwidth throttling,
- * and subscription management with an admin panel.
+ * subscription management, and restricted server access control.
  *
- * Features:
- * - Supports SOCKSv4, SOCKSv5, and HTTP/HTTPS (CONNECT) protocols.
- * - Protocol auto-detection on a single port.
- * - Per-user authentication, bandwidth throttling, and subscription expiry.
- * - Persistent user database using SQLite with automated schema migration.
- * - Web admin panel for user management and viewing earnings statistics.
+ * New Features (v3):
+ * - Immutable Financial Ledger: A new table `financial_records` is added to log
+ * all new user transactions. This prevents future user edits from affecting
+ * historical financial data.
+ * - Data Migration: On first run with this new table, the server migrates all
+ * existing users' billing data into the new `financial_records` table.
+ * - Accurate Stats: Dashboard stats (Today, Month, Total) are now calculated
+ * from the `financial_records` table for historical accuracy.
+ * - New Financials Page: A new `/financials` route with a bar chart
+ * (using Chart.js) to visualize monthly income over time.
  *
  * How to Run:
  * 1. Save this code as `proxy.js`.
@@ -47,24 +52,29 @@ const initialUsers = {
         password: 'password123',
         throttle: 250 * 1024, // 250 KB/s (~1.95 Mbps)
         bill_amount: 5,
-        valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] // 30 days from now
+        valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // 30 days from now
+        can_access_ftp: 0 // Cannot access restricted servers by default
     },
     'poweruser': {
         password: 'strongpassword',
         throttle: 2 * 1024 * 1024, // 2 MB/s (16 Mbps)
         bill_amount: 20,
-        valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+        valid_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        can_access_ftp: 1 // Can access restricted servers
     },
     'unlimited': {
         password: 'freeuser',
         throttle: -1, // -1 means unlimited speed
         bill_amount: 0,
-        valid_until: '2099-12-31'
+        valid_until: '2099-12-31',
+        can_access_ftp: 0
     }
 };
 
 // In-memory cache for users, loaded from the database on startup.
 let users = {};
+// In-memory set for restricted servers, loaded from DB on startup.
+let restrictedServers = new Set();
 
 // --- DATABASE MANAGEMENT ---
 const db = new sqlite3.Database(DB_FILE, (err) => {
@@ -78,42 +88,46 @@ const db = new sqlite3.Database(DB_FILE, (err) => {
 function initializeDatabase() {
     return new Promise((resolve, reject) => {
         db.serialize(() => {
-            // Create table if it doesn't exist
+            // Create users table if it doesn't exist
             db.run(`CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 password TEXT NOT NULL,
                 throttle INTEGER NOT NULL,
                 valid_until TEXT,
                 bill_amount REAL DEFAULT 0,
-                created_at TEXT
+                created_at TEXT,
+                can_access_ftp BOOLEAN DEFAULT 0
             )`, (err) => {
                 if (err) return reject(err);
                 log('Users table checked/created.');
 
-                // Add new columns for backward compatibility (migration)
-                const columns = ['valid_until TEXT', 'bill_amount REAL DEFAULT 0', 'created_at TEXT'];
-                columns.forEach(column => {
-                    db.run(`ALTER TABLE users ADD COLUMN ${column}`, () => { /* Ignore errors if column exists */ });
+                // Create restricted servers table
+                db.run(`CREATE TABLE IF NOT EXISTS restricted_servers (
+                    url TEXT PRIMARY KEY
+                )`, (err) => {
+                    if (err) return reject(err);
+                    log('Restricted servers table checked/created.');
                 });
 
-                db.get('SELECT COUNT(*) as count FROM users', (err, row) => {
+                // NEW: Create financial records table
+                db.run(`CREATE TABLE IF NOT EXISTS financial_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    amount REAL NOT NULL,
+                    transaction_date TEXT NOT NULL,
+                    description TEXT,
+                    FOREIGN KEY(username) REFERENCES users(username) ON DELETE SET NULL
+                )`, (err) => {
                     if (err) return reject(err);
-                    if (row.count === 0) {
-                        log('Users table is empty. Populating with initial users...');
-                        const stmt = db.prepare('INSERT INTO users (username, password, throttle, bill_amount, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?)');
-                        for (const username in initialUsers) {
-                            const user = initialUsers[username];
-                            stmt.run(username, user.password, user.throttle, user.bill_amount, user.valid_until, new Date().toISOString());
-                        }
-                        stmt.finalize((err) => {
-                            if (err) return reject(err);
-                            log('Initial users have been added.');
-                            loadUsersFromDb().then(resolve).catch(reject);
-                        });
-                    } else {
-                        loadUsersFromDb().then(resolve).catch(reject);
-                    }
+                    log('Financial records table checked/created.');
+
+                    // All tables are checked/created, now load caches and resolve.
+                    loadUsersFromDb()
+                        .then(loadRestrictedServers)
+                        .then(resolve)
+                        .catch(reject);
                 });
+
             });
         });
     });
@@ -129,11 +143,25 @@ function loadUsersFromDb() {
                     password: row.password,
                     throttle: row.throttle,
                     valid_until: row.valid_until,
-                    bill_amount: row.bill_amount
+                    bill_amount: row.bill_amount,
+                    can_access_ftp: !!row.can_access_ftp // NEW: Load access flag (convert 0/1 to false/true)
                 };
             });
             users = newUsers; // Atomically swap the cache
             log(`Reloaded ${Object.keys(users).length} users from the database.`);
+            resolve();
+        });
+    });
+}
+
+// NEW: Function to load restricted servers into memory
+function loadRestrictedServers() {
+    return new Promise((resolve, reject) => {
+        db.all('SELECT url FROM restricted_servers', (err, rows) => {
+            if (err) return reject(err);
+            const newServerSet = new Set(rows.map(row => row.url));
+            restrictedServers = newServerSet; // Atomically swap the cache
+            log(`Reloaded ${restrictedServers.size} restricted servers from the database.`);
             resolve();
         });
     });
@@ -339,7 +367,9 @@ function handleSocks5(clientSocket, initialData) {
                 if (remainingData.length > 0) { remoteSocket.write(remainingData); }
             }, (err) => {
                 log(`SOCKS5: Connection to ${host}:${port} failed: ${err.message}`);
-                const reply = Buffer.from([0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                // NEW: Send "Connection not allowed by ruleset" if it was our custom error
+                const errorCode = err.message === 'Access denied to restricted server' ? 0x02 : 0x01;
+                const reply = Buffer.from([0x05, errorCode, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
                 clientSocket.end(reply);
             });
         }
@@ -421,7 +451,12 @@ function handleHttp(clientSocket, initialData) {
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
             pipeData(clientSocket, remoteSocket, user, 'HTTPS CONNECT');
         }, (err) => {
-            clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+            // NEW: Send 403 Forbidden if access was denied by our rules
+            if (err.message === 'Access denied to restricted server') {
+                clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+            } else {
+                clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+            }
         });
     } else {
         try {
@@ -433,7 +468,12 @@ function handleHttp(clientSocket, initialData) {
                 remoteSocket.write(initialData);
                 pipeData(clientSocket, remoteSocket, user, `HTTP ${method}`);
             }, (err) => {
-                clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+                // NEW: Send 403 Forbidden if access was denied by our rules
+                if (err.message === 'Access denied to restricted server') {
+                    clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+                } else {
+                    clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
+                }
             });
         } catch (error) { 
             clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); 
@@ -443,6 +483,15 @@ function handleHttp(clientSocket, initialData) {
 
 // --- UTILITY FUNCTIONS ---
 function createRemoteConnection(clientSocket, user, host, port, successCallback, errorCallback) {
+    // NEW: Access Control Check
+    // We check if the user exists, if they DO NOT have access, AND if the host is in the restricted list.
+    if (user && !user.can_access_ftp && restrictedServers.has(host)) {
+        log(`Access DENIED for user '${user.username}' to restricted server: ${host}`);
+        // Return a specific error that the protocol handlers can check for.
+        return errorCallback(new Error('Access denied to restricted server'));
+    }
+
+    // If check passes, proceed with DNS lookup and connection
     dns.lookup(host, (err, address) => {
         if (err) { return errorCallback(err); }
         const remoteSocket = net.createConnection({ host: address, port: port }, () => { 
@@ -552,9 +601,14 @@ const adminServer = http.createServer(async (req, res) => {
             const today = new Date().toISOString().slice(0, 10);
             const month = new Date().toISOString().slice(0, 7);
 
-            const earningsToday = await dbGet("SELECT SUM(bill_amount) as total FROM users WHERE date(created_at) = ?", [today]);
-            const earningsMonth = await dbGet("SELECT SUM(bill_amount) as total FROM users WHERE strftime('%Y-%m', created_at) = ?", [month]);
-            const earningsTotal = await dbGet("SELECT SUM(bill_amount) as total FROM users", []);
+            // NEW: Calculate stats from financial_records table
+            const earningsToday = await dbGet("SELECT SUM(amount) as total FROM financial_records WHERE date(transaction_date) = ?", [today]);
+            const earningsMonth = await dbGet("SELECT SUM(amount) as total FROM financial_records WHERE strftime('%Y-%m', transaction_date) = ?", [month]);
+            const earningsTotal = await dbGet("SELECT SUM(amount) as total FROM financial_records", []);
+
+
+            // Fetch the restricted server list
+            const serverList = await dbAll('SELECT url FROM restricted_servers ORDER BY url', []);
 
             const stats = {
                 today: earningsToday.total || 0,
@@ -563,46 +617,75 @@ const adminServer = http.createServer(async (req, res) => {
             };
             const pagination = { page, totalPages, limit, filter, totalUsers, search };
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(getDashboardPage(userList, stats, pagination));
+            res.end(getDashboardPage(userList, stats, pagination, serverList));
+
+        // NEW: Financials Page Route
+        } else if (pathname === '/financials') {
+            const chartData = await dbAll(`
+                SELECT strftime('%Y-%m', transaction_date) as month, SUM(amount) as monthly_income
+                FROM financial_records
+                GROUP BY month
+                ORDER BY month ASC
+            `);
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(getFinancialsPage(chartData));
 
         } else if (pathname === '/add-user' && req.method === 'POST') {
             let body = ''; 
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
-                const { username, password, throttle, bill_amount, valid_until } = querystring.parse(body);
+                const { username, password, throttle, bill_amount, valid_until, can_access_ftp } = querystring.parse(body);
                 
-                // FIX: The 'throttle' value is now the single, correct bytes/sec value
-                // from the hidden form field, as the original Mbps field is disabled on submit.
-                // No array check is needed.
                 const throttleBytes = throttle;
+                const canAccess = can_access_ftp === '1' ? 1 : 0;
+                const createdAt = new Date().toISOString();
+                const billAmountNum = parseFloat(bill_amount) || 0;
                 
-                const query = 'INSERT INTO users (username, password, throttle, bill_amount, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?)';
-                // Use throttleBytes in the query
-                const params = [username, password, parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, new Date().toISOString()];
+                const query = 'INSERT INTO users (username, password, throttle, bill_amount, valid_until, created_at, can_access_ftp) VALUES (?, ?, ?, ?, ?, ?, ?)';
+                const params = [username, password, parseInt(throttleBytes, 10), billAmountNum, valid_until, createdAt, canAccess];
                 
                 db.run(query, params, async function(err) {
-                    await loadUsersFromDb(); 
-                    res.writeHead(302, { 'Location': '/' });
-                    res.end();
+                    if (err) {
+                        log(`Error adding user: ${err.message}`);
+                        res.writeHead(302, { 'Location': '/?error=addUserFailed' }); // Redirect with error
+                        res.end();
+                        return;
+                    }
+
+                    // NEW: Log to financial records IF bill amount is positive
+                    if (billAmountNum > 0) {
+                        db.run('INSERT INTO financial_records (username, amount, transaction_date, description) VALUES (?, ?, ?, ?)',
+                            [username, billAmountNum, createdAt, 'New user subscription'],
+                            async (err) => {
+                                if (err) log(`Error logging financial record: ${err.message}`);
+                                await loadUsersFromDb(); // Reload users cache
+                                res.writeHead(302, { 'Location': '/' });
+                                res.end();
+                            }
+                        );
+                    } else {
+                        await loadUsersFromDb(); // Reload users cache
+                        res.writeHead(302, { 'Location': '/' });
+                        res.end();
+                    }
                 });
             });
         } else if (pathname === '/edit-user' && req.method === 'POST') {
             let body = ''; 
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
-                const { username, password, throttle, bill_amount, valid_until } = querystring.parse(body);
+                const { username, password, throttle, bill_amount, valid_until, can_access_ftp } = querystring.parse(body);
 
-                // FIX: The 'throttle' value is now the single, correct bytes/sec value
-                // from the hidden form field, as the original Mbps field is disabled on submit.
-                // No array check is needed.
                 const throttleBytes = throttle;
+                const canAccess = can_access_ftp === '1' ? 1 : 0;
 
-                const query = password ? 'UPDATE users SET password = ?, throttle = ?,, bill_amount = ?, valid_until = ? WHERE username = ?' : 'UPDATE users SET throttle = ?, bill_amount = ?, valid_until = ? WHERE username = ?';
-                // Use throttleBytes in the query
-                const params = password ? [password, parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, username] : [parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, username];
+                // NOTE: We DO NOT create a financial record on edit, as requested.
+                // We only update the user's *current* state.
+                const query = password ? 'UPDATE users SET password = ?, throttle = ?, bill_amount = ?, valid_until = ?, can_access_ftp = ? WHERE username = ?' : 'UPDATE users SET throttle = ?, bill_amount = ?, valid_until = ?, can_access_ftp = ? WHERE username = ?';
+                const params = password ? [password, parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, canAccess, username] : [parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, canAccess, username];
                 
                 db.run(query, params, async function(err) {
-                    await loadUsersFromDb(); 
+                    await loadUsersFromDb(); // Reload users cache
                     res.writeHead(302, { 'Location': '/' });
                     res.end();
                 });
@@ -612,8 +695,9 @@ const adminServer = http.createServer(async (req, res) => {
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
                 const { username } = querystring.parse(body);
+                // Note: Financial records are kept with username=NULL due to ON DELETE SET NULL
                 db.run('DELETE FROM users WHERE username = ?', username, async function(err) {
-                    await loadUsersFromDb(); 
+                    await loadUsersFromDb(); // Reload users cache
                     res.writeHead(302, { 'Location': '/' });
                     res.end();
                 });
@@ -638,10 +722,44 @@ const adminServer = http.createServer(async (req, res) => {
                         res.end(JSON.stringify({ message: 'Failed to delete users' }));
                         return;
                     }
-                    await loadUsersFromDb();
+                    await loadUsersFromDb(); // Reload users cache
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ message: 'Users deleted successfully' }));
                 });
+            });
+        // --- Routes for managing restricted servers ---
+        } else if (pathname === '/add-server' && req.method === 'POST') {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', async () => {
+                const { url } = querystring.parse(body);
+                if (url) {
+                    // INSERT OR IGNORE to prevent duplicates on PRIMARY KEY
+                    db.run('INSERT OR IGNORE INTO restricted_servers (url) VALUES (?)', [url.trim()], async function(err) {
+                        await loadRestrictedServers(); // Reload server cache
+                        res.writeHead(302, { 'Location': '/#servers' }); // Redirect back to server section
+                        res.end();
+                    });
+                } else {
+                    res.writeHead(302, { 'Location': '/#servers' });
+                    res.end();
+                }
+            });
+        } else if (pathname === '/delete-server' && req.method === 'POST') {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', async () => {
+                const { url } = querystring.parse(body);
+                if (url) {
+                    db.run('DELETE FROM restricted_servers WHERE url = ?', [url], async function(err) {
+                        await loadRestrictedServers(); // Reload server cache
+                        res.writeHead(302, { 'Location': '/#servers' }); // Redirect back to server section
+                        res.end();
+                    });
+                } else {
+                    res.writeHead(302, { 'Location': '/#servers' });
+                    res.end();
+                }
             });
         } else { 
             res.writeHead(404);
@@ -690,7 +808,8 @@ function getLoginPage(error = false) {
     `;
 }
 
-function getDashboardPage(userList, stats, pagination) {
+// NEW: Updated function signature to accept serverList
+function getDashboardPage(userList, stats, pagination, serverList) {
     const { page, totalPages, filter, limit, search, totalUsers } = pagination;
     const userRows = userList.map(user => {
         const today = new Date().setHours(0,0,0,0);
@@ -698,6 +817,10 @@ function getDashboardPage(userList, stats, pagination) {
         const isActive = expiryDate >= today;
         const statusClass = isActive ? 'bg-green-500' : 'bg-red-500';
         const statusText = isActive ? 'Active' : 'Expired';
+
+        // Add FTP Access status
+        const ftpAccessText = user.can_access_ftp ? 'Yes' : 'No';
+        const ftpAccessClass = user.can_access_ftp ? 'text-green-400' : 'text-red-400';
 
         return `
         <tr class="border-b bg-gray-800 border-gray-700 hover:bg-gray-600">
@@ -715,8 +838,10 @@ function getDashboardPage(userList, stats, pagination) {
             <td class="px-6 py-4">${user.throttle === -1 ? 'Unlimited' : `${((user.throttle * 8) / (1000 * 1000)).toFixed(2)} Mbps`}</td>
             <td class="px-6 py-4">$${(user.bill_amount || 0).toFixed(2)}</td>
             <td class="px-6 py-4">${user.valid_until || 'N/A'}</td>
+            <td class="px-6 py-4 ${ftpAccessClass}">${ftpAccessText}</td>
             <td class="px-6 py-4 text-right">
-                <button onclick="openEditModal('${user.username}', ${user.throttle}, ${user.bill_amount || 0}, '${user.valid_until || ''}')" class="font-medium text-blue-500 hover:underline mr-4">Edit</button>
+                <!-- Pass can_access_ftp flag to edit modal -->
+                <button onclick="openEditModal('${user.username}', ${user.throttle}, ${user.bill_amount || 0}, '${user.valid_until || ''}', ${user.can_access_ftp})" class="font-medium text-blue-500 hover:underline mr-4">Edit</button>
                 <button onclick="confirmDelete('${user.username}')" class="font-medium text-red-500 hover:underline">Delete</button>
             </td>
         </tr>
@@ -777,6 +902,17 @@ function getDashboardPage(userList, stats, pagination) {
         </nav>`;
     }
 
+    // Generate server list HTML
+    const serverListHtml = serverList.length > 0 ? serverList.map(server => `
+        <div class="flex items-center justify-between p-2.5 bg-gray-700 rounded-lg mb-2">
+            <span class="font-mono text-sm">${server.url}</span>
+            <form action="/delete-server" method="POST" class="inline">
+                <input type="hidden" name="url" value="${server.url}">
+                <button type="submit" class="font-medium text-red-500 hover:underline text-sm" aria-label="Delete server ${server.url}">Delete</button>
+            </form>
+        </div>
+    `).join('') : '<p class="text-gray-400 text-sm">No servers are currently restricted.</p>';
+
     return `
     <!DOCTYPE html>
     <html lang="en" class="bg-gray-900 text-white">
@@ -785,13 +921,19 @@ function getDashboardPage(userList, stats, pagination) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Admin Dashboard</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            /* Smooth scrolling for anchor links */
+            html { scroll-behavior: smooth; }
+        </style>
     </head>
     <body class="p-4 sm:p-6 md:p-8">
         <div class="max-w-7xl mx-auto">
             <header class="flex flex-wrap items-center justify-between gap-4 mb-8">
                 <h1 class="text-3xl font-bold">Proxy User Management</h1>
-                <div>
-                    <button onclick="openAddModal()" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:ring-4 focus:ring-blue-800 mr-4">Add User</button>
+                <div class="flex items-center gap-4">
+                    <!-- NEW: Financials Link -->
+                    <a href="/financials" class="text-base font-medium text-blue-400 hover:text-blue-300">Financials</a>
+                    <button onclick="openAddModal()" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:ring-4 focus:ring-blue-800">Add User</button>
                     <a href="/logout" class="px-5 py-2.5 text-base font-medium text-white bg-gray-600 rounded-lg hover:bg-gray-700 focus:ring-4 focus:ring-gray-800">Logout</a>
                 </div>
             </header>
@@ -803,6 +945,29 @@ function getDashboardPage(userList, stats, pagination) {
                 <div class="p-6 bg-gray-800 rounded-lg"><p class="text-sm text-gray-400">Total Earnings</p><p class="text-3xl font-bold">$${stats.total.toFixed(2)}</p></div>
             </div>
 
+            <!-- Server Management Section -->
+            <div id="servers" class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8 pt-4">
+                <div class="p-6 bg-gray-800 rounded-lg">
+                    <h2 class="text-xl font-bold mb-4">Add Restricted Server</h2>
+                    <form action="/add-server" method="POST" class="space-y-4">
+                        <div>
+                            <label for="server_url" class="block mb-2 text-sm font-medium">Server Host (e.g., ftp.example.com)</label>
+                            <input type="text" name="url" id="server_url" class="w-full px-4 py-2 text-white bg-gray-700 border border-gray-600 rounded-lg" placeholder="ftp.example.com" required>
+                            <p class="text-xs text-gray-400 mt-1">This will block connections to the specified host (e.g., "ftp.example.com").</p>
+                        </div>
+                        <button type="submit" class="w-full px-5 py-2.5 text-base font-medium text-center text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:ring-4 focus:ring-blue-800">Add Server</button>
+                    </form>
+                </div>
+                <div class="p-6 bg-gray-800 rounded-lg">
+                    <h2 class="text-xl font-bold mb-4">Current Restricted Servers (${serverList.length})</h2>
+                    <div class="max-h-60 overflow-y-auto pr-2">
+                        ${serverListHtml}
+                    </div>
+                </div>
+            </div>
+
+            <!-- User Management Section -->
+            <h2 class="text-2xl font-bold mb-4 pt-4 border-t border-gray-700">User List</h2>
             <div class="bg-gray-800 p-4 rounded-lg mb-4">
                  <!-- Row 1: Search -->
                 <div class="mb-4">
@@ -811,7 +976,7 @@ function getDashboardPage(userList, stats, pagination) {
                         <input type="hidden" name="filter" value="${filter}">
                         <div class="relative w-full">
                             <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                                <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w0.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
+                                <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
                             </div>
                             <input type="search" name="search" value="${search}" placeholder="Search by username..." class="block w-full p-2.5 pl-10 text-sm rounded-lg bg-gray-700 border-gray-600 placeholder-gray-400 text-white focus:ring-blue-500 focus:border-blue-500">
                         </div>
@@ -843,10 +1008,11 @@ function getDashboardPage(userList, stats, pagination) {
                             <th scope="col" class="px-6 py-3">Bandwidth Throttle</th>
                             <th scope="col" class="px-6 py-3">Bill Amount</th>
                             <th scope="col" class="px-6 py-3">Valid Until</th>
+                            <th scope="col" class="px-6 py-3">FTP Access</th>
                             <th scope="col" class="px-6 py-3"><span class="sr-only">Actions</span></th>
                         </tr>
                     </thead>
-                    <tbody> ${userRows.length > 0 ? userRows : `<tr><td colspan="7" class="text-center py-8 text-gray-500">No users found.</td></tr>`} </tbody>
+                    <tbody> ${userRows.length > 0 ? userRows : `<tr><td colspan="8" class="text-center py-8 text-gray-500">No users found.</td></tr>`} </tbody>
                 </table>
             </div>
             
@@ -891,6 +1057,14 @@ function getDashboardPage(userList, stats, pagination) {
                             <button type="button" onclick="addDays(30)" class="px-3 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded-md">30 Days</button>
                         </div>
                     </div>
+                    <!-- FTP Access Checkbox -->
+                    <div class="pt-2">
+                        <div class="flex items-center">
+                            <input id="can_access_ftp" name="can_access_ftp" type="checkbox" value="1" class="w-4 h-4 text-blue-600 bg-gray-700 border-gray-600 rounded focus:ring-blue-600 ring-offset-gray-800 focus:ring-2">
+                            <label for="can_access_ftp" class="ml-2 text-sm font-medium text-gray-300">Grant FTP Server Access</label>
+                        </div>
+                        <p class="text-xs text-gray-400 mt-1">Allows this user to access servers on the restricted list.</p>
+                    </div>
                     <div class="flex justify-end gap-4 pt-4">
                         <button type="button" onclick="closeModal()" class="px-5 py-2.5 text-base font-medium text-gray-300 bg-gray-700 rounded-lg hover:bg-gray-600">Cancel</button>
                         <button type="submit" class="px-5 py-2.5 text-base font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Save User</button>
@@ -913,6 +1087,7 @@ function getDashboardPage(userList, stats, pagination) {
             const editUsernameInput = document.getElementById('editUsername');
             const throttleInput = document.getElementById('throttle');
             const validUntilInput = document.getElementById('valid_until');
+            const ftpCheckbox = document.getElementById('can_access_ftp'); // Get checkbox
             const confirmModal = document.getElementById('confirmModal');
             const confirmTitle = document.getElementById('confirmTitle');
             const confirmMessage = document.getElementById('confirmMessage');
@@ -930,9 +1105,11 @@ function getDashboardPage(userList, stats, pagination) {
                 usernameInput.disabled = false; editUsernameInput.disabled = true;
                 passwordInput.required = true; passwordHint.textContent = '';
                 validUntilInput.value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+                ftpCheckbox.checked = false; // Ensure unchecked for new users
                 userModal.style.display = 'flex';
             }
-            function openEditModal(username, throttle, billAmount, validUntil) {
+            // Updated signature to accept canAccessFtp
+            function openEditModal(username, throttle, billAmount, validUntil, canAccessFtp) {
                 form.reset(); form.action = '/edit-user'; title.textContent = 'Edit User: ' + username;
                 usernameInput.value = username; usernameInput.disabled = true; 
                 editUsernameInput.value = username; editUsernameInput.disabled = false;
@@ -942,6 +1119,7 @@ function getDashboardPage(userList, stats, pagination) {
                 throttleInput.value = throttle === -1 ? -1 : ((throttle * 8) / (1000 * 1000)).toFixed(2);
                 document.getElementById('bill_amount').value = billAmount;
                 validUntilInput.value = validUntil;
+                ftpCheckbox.checked = !!canAccessFtp; // Set checkbox state
                 userModal.style.display = 'flex';
             }
             function closeModal(event) { if (!event || event.target === userModal) { userModal.style.display = 'none'; } }
@@ -1017,7 +1195,7 @@ function getDashboardPage(userList, stats, pagination) {
                     } else if ([...userCheckboxes].some(cb => cb.checked)) {
                          selectAllCheckbox.checked = false;
                          selectAllCheckbox.indeterminate = true;
-D                    } else {
+                    } else {
                          selectAllCheckbox.checked = false;
                          selectAllCheckbox.indeterminate = false;
                     }
@@ -1048,6 +1226,114 @@ D                    } else {
     `;
 }
 
+// NEW: Page for Financials
+function getFinancialsPage(chartData) {
+    // Process data for Chart.js
+    const labels = chartData.map(d => d.month);
+    const data = chartData.map(d => d.monthly_income);
+    const totalIncome = data.reduce((acc, val) => acc + val, 0);
+
+    return `
+    <!DOCTYPE html>
+    <html lang="en" class="bg-gray-900 text-white">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Financial Report</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            html { scroll-behavior: smooth; }
+        </style>
+    </head>
+    <body class="p-4 sm:p-6 md:p-8">
+        <div class="max-w-7xl mx-auto">
+            <header class="flex flex-wrap items-center justify-between gap-4 mb-8">
+                <h1 class="text-3xl font-bold">Financial Report</h1>
+                <div class="flex items-center gap-4">
+                    <a href="/" class="text-base font-medium text-blue-400 hover:text-blue-300">Back to Dashboard</a>
+                    <a href="/logout" class="px-5 py-2.5 text-base font-medium text-white bg-gray-600 rounded-lg hover:bg-gray-700 focus:ring-4 focus:ring-gray-800">Logout</a>
+                </div>
+            </header>
+
+            <div class="p-6 bg-gray-800 rounded-lg mb-8">
+                <p class="text-sm text-gray-400">Total All-Time Income</p>
+                <p class="text-3xl font-bold">$${totalIncome.toFixed(2)}</p>
+            </div>
+
+            <div class="p-6 bg-gray-800 rounded-lg">
+                <h2 class="text-xl font-bold mb-4">Income by Month</h2>
+                <div class="relative h-96">
+                    <canvas id="incomeChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const chartData = ${JSON.stringify(chartData)};
+            const labels = chartData.map(d => d.month);
+            const data = chartData.map(d => d.monthly_income);
+
+            const ctx = document.getElementById('incomeChart').getContext('2d');
+            
+            // Set default font color for Chart.js
+            Chart.defaults.color = '#9ca3af'; // text-gray-400
+            Chart.defaults.borderColor = '#374151'; // border-gray-700
+
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Monthly Income',
+                        data: data,
+                        backgroundColor: 'rgba(59, 130, 246, 0.5)', // bg-blue-500 with opacity
+                        borderColor: 'rgba(59, 130, 246, 1)', // border-blue-500
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function(value) {
+                                    return '$' + value;
+                                }
+                            },
+                            grid: {
+                                color: '#374151' // grid-gray-700
+                            }
+                        },
+                        x: {
+                             grid: {
+                                display: false
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return 'Income: $' + context.parsed.y.toFixed(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        </script>
+    </body>
+    </html>
+    `;
+}
+
+
 // --- START SERVER ---
 initializeDatabase().then(() => {
     server.listen(PROXY_PORT, '0.0.0.0', () => { log(`Multi-protocol proxy server listening on port ${PROXY_PORT}`); });
@@ -1055,6 +1341,7 @@ initializeDatabase().then(() => {
         log(`Admin panel listening on http://localhost:${ADMIN_PORT}`);
         log(`Admin User: ${ADMIN_USERNAME}`);
         log('Users loaded: ' + Object.keys(users).join(', '));
+        log('Restricted servers loaded: ' + [...restrictedServers].join(', '));
     });
 }).catch(err => { console.error('Failed to initialize and start the server:', err); process.exit(1); });
 
