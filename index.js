@@ -140,32 +140,85 @@ function loadUsersFromDb() {
 }
 
 
-// --- BANDWIDTH THROTTLING ---
+// --- BANDWIDTH THROTTLING (FIXED) ---
+/**
+ * A Duplex stream that throttles data flow to a specified rate (in bytes per second).
+ * This implementation uses a "token bucket" style algorithm that correctly handles
+ * idle time (preventing burst credits) and provides a smoother flow of data.
+ */
 class ThrottledStream extends Duplex {
     constructor(rate) { // rate in bytes per second
         super();
-        this.rate = rate;
-        this.buffer = [];
-        this.isProcessing = false;
-        this.startTime = Date.now();
-        this.bytesProcessed = 0;
+        this.rate = rate; // Bytes per second
+        this.buffer = []; // Our internal buffer for chunks
+        this.isProcessing = false; // Flag to prevent concurrent _processBuffer calls
+        
+        // This is the "virtual" time the next chunk is allowed to be sent.
+        // It starts at the current time.
+        this.nextSendTime = Date.now();
     }
+
     _write(chunk, encoding, callback) {
+        // Add the chunk and its callback to our buffer
         this.buffer.push({ chunk, callback });
-        if (!this.isProcessing) { this._processBuffer(); }
+        
+        // If we're not already processing, kick off the processing loop
+        if (!this.isProcessing) {
+            this._processBuffer();
+        }
     }
-    _read(size) { /* No-op */ }
+
+    _read(size) {
+        // No-op. Data is pushed manually in _processBuffer.
+    }
+
     _processBuffer() {
-        if (this.buffer.length === 0) { this.isProcessing = false; return; }
+        // If buffer is empty, stop processing
+        if (this.buffer.length === 0) {
+            this.isProcessing = false;
+            return;
+        }
+
         this.isProcessing = true;
         const { chunk, callback } = this.buffer.shift();
-        this.push(chunk);
-        this.bytesProcessed += chunk.length;
-        const elapsedTime = (Date.now() - this.startTime) / 1000;
-        const expectedTime = (this.bytesProcessed / this.rate);
-        const delay = Math.max(0, (expectedTime - elapsedTime) * 1000);
-        callback();
-        setTimeout(() => this._processBuffer(), delay);
+
+        // Calculate how long this chunk *should* take to send in milliseconds
+        const chunkSendTime = (chunk.length / this.rate) * 1000;
+
+        const now = Date.now();
+
+        // ---- This is the core logic ----
+        
+        // 1. Check if we are "in credit" from a previous idle period.
+        // If nextSendTime is in the past, it means we were idle.
+        // We must "fast-forward" nextSendTime to "now" to prevent
+        // that idle time from turning into a massive "burst credit".
+        if (this.nextSendTime < now) {
+            this.nextSendTime = now;
+        }
+
+        // 2. Calculate the delay.
+        // This is the difference between when we *can* send (nextSendTime)
+        // and when it is *now*.
+        const delay = Math.max(0, this.nextSendTime - now);
+
+        // 3. Schedule the send.
+        // We add this chunk's "cost" (chunkSendTime) to the nextSendTime,
+        // so the *next* chunk will be scheduled correctly after this one.
+        this.nextSendTime += chunkSendTime;
+        
+        // 4. Execute after the calculated delay
+        setTimeout(() => {
+            // Push the data to the readable side (e.g., to the remote socket)
+            this.push(chunk);
+            
+            // Signal to the writable side (e.g., from the client socket)
+            // that we are ready for *more* data. This provides backpressure.
+            callback();
+            
+            // Process the next item in our buffer
+            this._processBuffer();
+        }, delay);
     }
 }
 
@@ -406,7 +459,8 @@ function createRemoteConnection(clientSocket, user, host, port, successCallback,
 function pipeData(clientSocket, remoteSocket, user, connectionType) {
     const userLabel = user ? user.username : 'unauthenticated';
     const throttleRate = user ? user.throttle : -1;
-    log(`Piping data for ${connectionType} connection. User: ${userLabel}. Throttle: ${throttleRate === -1 ? 'Unlimited' : `${((throttleRate * 8) / (1024 * 1024)).toFixed(2)} Mbps`}`);
+    // FIX 1: Use 1000*1000 for logging consistency
+    log(`Piping data for ${connectionType} connection. User: ${userLabel}. Throttle: ${throttleRate === -1 ? 'Unlimited' : `${((throttleRate * 8) / (1000 * 1000)).toFixed(2)} Mbps`}`);
     
     if (throttleRate > 0) {
         const clientToRemoteThrottler = new ThrottledStream(throttleRate);
@@ -516,8 +570,16 @@ const adminServer = http.createServer(async (req, res) => {
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
                 const { username, password, throttle, bill_amount, valid_until } = querystring.parse(body);
+                
+                // FIX: The 'throttle' value is now the single, correct bytes/sec value
+                // from the hidden form field, as the original Mbps field is disabled on submit.
+                // No array check is needed.
+                const throttleBytes = throttle;
+                
                 const query = 'INSERT INTO users (username, password, throttle, bill_amount, valid_until, created_at) VALUES (?, ?, ?, ?, ?, ?)';
-                const params = [username, password, parseInt(throttle, 10), parseFloat(bill_amount), valid_until, new Date().toISOString()];
+                // Use throttleBytes in the query
+                const params = [username, password, parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, new Date().toISOString()];
+                
                 db.run(query, params, async function(err) {
                     await loadUsersFromDb(); 
                     res.writeHead(302, { 'Location': '/' });
@@ -529,8 +591,16 @@ const adminServer = http.createServer(async (req, res) => {
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', async () => {
                 const { username, password, throttle, bill_amount, valid_until } = querystring.parse(body);
-                const query = password ? 'UPDATE users SET password = ?, throttle = ?, bill_amount = ?, valid_until = ? WHERE username = ?' : 'UPDATE users SET throttle = ?, bill_amount = ?, valid_until = ? WHERE username = ?';
-                const params = password ? [password, parseInt(throttle, 10), parseFloat(bill_amount), valid_until, username] : [parseInt(throttle, 10), parseFloat(bill_amount), valid_until, username];
+
+                // FIX: The 'throttle' value is now the single, correct bytes/sec value
+                // from the hidden form field, as the original Mbps field is disabled on submit.
+                // No array check is needed.
+                const throttleBytes = throttle;
+
+                const query = password ? 'UPDATE users SET password = ?, throttle = ?,, bill_amount = ?, valid_until = ? WHERE username = ?' : 'UPDATE users SET throttle = ?, bill_amount = ?, valid_until = ? WHERE username = ?';
+                // Use throttleBytes in the query
+                const params = password ? [password, parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, username] : [parseInt(throttleBytes, 10), parseFloat(bill_amount), valid_until, username];
+                
                 db.run(query, params, async function(err) {
                     await loadUsersFromDb(); 
                     res.writeHead(302, { 'Location': '/' });
@@ -635,13 +705,14 @@ function getDashboardPage(userList, stats, pagination) {
                 <input type="checkbox" name="usernames" value="${user.username}" class="user-checkbox w-4 h-4 text-blue-600 bg-gray-700 border-gray-600 rounded focus:ring-blue-600 ring-offset-gray-800 focus:ring-2">
             </td>
             <td class="px-6 py-4 font-mono">${user.username}</td>
-            <td class="px-6 py-4">
+            <td class.px-6.py-4>
                 <span class="flex items-center">
                     <span class="inline-block w-3 h-3 ${statusClass} rounded-full mr-2"></span>
                     ${statusText}
                 </span>
             </td>
-            <td class="px-6 py-4">${user.throttle === -1 ? 'Unlimited' : `${((user.throttle * 8) / (1024 * 1024)).toFixed(2)} Mbps`}</td>
+            <!-- FIX 2: Use 1000*1000 for table display consistency -->
+            <td class="px-6 py-4">${user.throttle === -1 ? 'Unlimited' : `${((user.throttle * 8) / (1000 * 1000)).toFixed(2)} Mbps`}</td>
             <td class="px-6 py-4">$${(user.bill_amount || 0).toFixed(2)}</td>
             <td class="px-6 py-4">${user.valid_until || 'N/A'}</td>
             <td class="px-6 py-4 text-right">
@@ -740,7 +811,7 @@ function getDashboardPage(userList, stats, pagination) {
                         <input type="hidden" name="filter" value="${filter}">
                         <div class="relative w-full">
                             <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                                <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
+                                <svg class="w-4 h-4 text-gray-400" aria-hidden="true" xmlns="http://www.w0.org/2000/svg" fill="none" viewBox="0 0 20 20"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"/></svg>
                             </div>
                             <input type="search" name="search" value="${search}" placeholder="Search by username..." class="block w-full p-2.5 pl-10 text-sm rounded-lg bg-gray-700 border-gray-600 placeholder-gray-400 text-white focus:ring-blue-500 focus:border-blue-500">
                         </div>
@@ -867,7 +938,8 @@ function getDashboardPage(userList, stats, pagination) {
                 editUsernameInput.value = username; editUsernameInput.disabled = false;
                 passwordInput.placeholder = "Leave blank to keep unchanged"; passwordInput.required = false; 
                 passwordHint.textContent = '(Leave blank to keep unchanged)';
-                throttleInput.value = throttle === -1 ? -1 : ((throttle * 8) / (1024 * 1024)).toFixed(2);
+                // FIX 3: Use 1000*1000 for modal display consistency
+                throttleInput.value = throttle === -1 ? -1 : ((throttle * 8) / (1000 * 1000)).toFixed(2);
                 document.getElementById('bill_amount').value = billAmount;
                 validUntilInput.value = validUntil;
                 userModal.style.display = 'flex';
@@ -880,10 +952,25 @@ function getDashboardPage(userList, stats, pagination) {
             }
             form.addEventListener('submit', function(e) {
                 const throttleMbps = parseFloat(throttleInput.value);
-                const throttleBytes = throttleMbps === -1 ? -1 : Math.round((throttleMbps * 1024 * 1024) / 8);
-                const hiddenInput = document.createElement('input');
-                hiddenInput.type = 'hidden'; hiddenInput.name = 'throttle'; hiddenInput.value = throttleBytes;
-                form.appendChild(hiddenInput);
+                
+                // FIX 1: Use megabits (1,000,000) not mebibits (1,048,576) for speed test consistency
+                const throttleBytes = throttleMbps === -1 ? -1 : Math.round((throttleMbps * 1000 * 1000) / 8);
+
+                // Check if the hidden input already exists
+                let hiddenInput = form.querySelector('input[name="throttle"]');
+                if (!hiddenInput || hiddenInput.type !== 'hidden') {
+                    // Create it if it doesn't exist or if it's the visible one
+                    hiddenInput = document.createElement('input');
+                    hiddenInput.type = 'hidden';
+                    hiddenInput.name = 'throttle';
+                    form.appendChild(hiddenInput);
+                }
+                hiddenInput.value = throttleBytes;
+                
+                // FIX 2: Disable the visible Mbps input field.
+                // This ensures it is *not* included in the form submission,
+                // preventing the server from receiving an array of throttle values.
+                throttleInput.disabled = true;
             });
 
             // --- Alert/Confirm Modal Logic ---
@@ -930,7 +1017,7 @@ function getDashboardPage(userList, stats, pagination) {
                     } else if ([...userCheckboxes].some(cb => cb.checked)) {
                          selectAllCheckbox.checked = false;
                          selectAllCheckbox.indeterminate = true;
-                    } else {
+D                    } else {
                          selectAllCheckbox.checked = false;
                          selectAllCheckbox.indeterminate = false;
                     }
@@ -975,6 +1062,3 @@ server.on('error', (err) => {
     console.error(`Server error: ${err.message}`);
     if (err.code === 'EADDRINUSE') { console.error(`Port ${PROXY_PORT} is already in use.`); }
 });
-
-
-
